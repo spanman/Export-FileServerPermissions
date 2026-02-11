@@ -1,0 +1,30 @@
+# PowerShell
+*.ps1xml
+*.psd1_*
+
+# Output files
+*.cypher
+*.log
+*.csv
+
+# Credentials and secrets
+*credential*
+*secret*
+*password*
+
+# IDE
+.vscode/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Test output
+test-results/
+coverage/
