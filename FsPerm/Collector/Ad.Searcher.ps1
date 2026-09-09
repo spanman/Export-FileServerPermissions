@@ -157,7 +157,15 @@ function New-FsAdEntry {
         $hasServer = ($rest -match '^[^/=,]+/')
         if (-not $hasServer) { $p = '{0}://{1}/{2}' -f $scheme, $Server, $rest }
     }
-    $authType = [System.DirectoryServices.AuthenticationTypes]::Secure -bor [System.DirectoryServices.AuthenticationTypes]::Signing -bor [System.DirectoryServices.AuthenticationTypes]::Sealing
+    # Secure only - not `-bor Signing -bor Sealing`. That combination demands a fully negotiated,
+    # encrypted SASL channel for every real LDAP operation; a real production run showed it let a
+    # lightweight RootDSE property read succeed while every actual search/refresh (a different DN's
+    # DirectoryEntry.RefreshCache, and DirectorySearcher.FindAll for both the domain object and a
+    # completely unrelated crossRef subtree search) failed uniformly with LDAP's generic "An
+    # operations error occurred" - the classic symptom of this exact combination failing to negotiate
+    # (VPN/NAT paths and Kerberos encryption-type mismatches are the usual causes). Secure alone still
+    # authenticates (NTLM/Kerberos, not anonymous) and is the standard, broadly-compatible ADSI bind.
+    $authType = [System.DirectoryServices.AuthenticationTypes]::Secure
     if ($Credential) {
         return New-Object System.DirectoryServices.DirectoryEntry($p, $Credential.UserName, $Credential.GetNetworkCredential().Password, $authType)
     }
