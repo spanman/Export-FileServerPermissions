@@ -1,0 +1,31 @@
+# Generated Obsidian vault (contains SIDs, account names and access data - never commit)
+vault/
+
+# Snapshots and build output
+*.json.gz
+build/out/
+test-results/
+coverage/
+
+# Legacy output
+*.cypher
+*.log
+*.csv
+
+# Secrets (keep narrow so source files with these words are not ignored)
+secrets/
+*.cred
+*.pfx
+
+# IDE
+.vscode/
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini

@@ -1,0 +1,18 @@
+{
+  // Lint configuration for the generated Obsidian vault (build/Invoke-Lint.ps1).
+  "config": {
+    "default": true,
+    "MD013": false, // line length: tables and long UNC paths
+    "MD033": false, // inline HTML: <br> in table cells
+    "MD041": false, // first line heading: files start with YAML frontmatter
+    "MD024": false, // duplicate headings across report sections
+    "MD025": false, // single H1: frontmatter title + H1
+    "MD060": false, // table column style
+    "MD034": false  // bare URLs
+  },
+  "ignores": [
+    "_meta/**",
+    ".obsidian/**",
+    "**/node_modules/**"
+  ]
+}

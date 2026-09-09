@@ -1,0 +1,45 @@
+# Convenience wrappers around the containers used by build/build.ps1.
+#   docker compose -f build/docker-compose.yml run --rm test
+#   docker compose -f build/docker-compose.yml run --rm analyze
+#   docker compose -f build/docker-compose.yml run --rm fixtures
+#   docker compose -f build/docker-compose.yml run --rm render-fixtures
+#   docker compose -f build/docker-compose.yml run --rm mdlint
+services:
+  test:
+    image: fsperm-test
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    volumes:
+      - ..:/work
+    working_dir: /work
+    command: ["-File", "./build/Invoke-Tests.ps1"]
+
+  analyze:
+    image: fsperm-test
+    volumes:
+      - ..:/work
+    working_dir: /work
+    command: ["-File", "./build/Invoke-Analyze.ps1"]
+
+  fixtures:
+    image: fsperm-test
+    volumes:
+      - ..:/work
+    working_dir: /work
+    command: ["-File", "./tests/fixtures/New-Fixtures.ps1"]
+
+  render-fixtures:
+    image: fsperm-test
+    volumes:
+      - ..:/work
+    working_dir: /work
+    command: ["-File", "./build/Invoke-RenderFixtures.ps1"]
+
+  mdlint:
+    image: davidanson/markdownlint-cli2:latest
+    volumes:
+      - ../build/out/fixture-vault:/work:ro
+      - ../.markdownlint-cli2.jsonc:/work/.markdownlint-cli2.jsonc:ro
+    working_dir: /work
+    command: ["**/*.md"]

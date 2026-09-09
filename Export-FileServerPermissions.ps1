@@ -1,432 +1,192 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Enumerates file server shares and NTFS permissions, outputting Cypher code for graph database import.
+    Scans a Windows file server's share and NTFS permissions, maps Active Directory group membership,
+    and renders everything into an Obsidian vault with reports, a dashboard and change tracking.
 
 .DESCRIPTION
-    Connects to a file server, enumerates shares, and documents share-level and NTFS permissions.
-    Outputs Cypher code to create nodes and relationships for Server, Share, User, and Group entities.
+    Two phases, both on by default:
+
+      1. Scan    Connects to -ServerName over WinRM with -Credential (prompted when omitted), enumerates shares,
+                 share ACLs and NTFS ACLs down to -Depth (recording only folders whose ACL diverges from the parent),
+                 resolves every principal in Active Directory via ADSI, and expands group membership (direct, nested,
+                 primary group, and server-local groups). The result is saved as a gzipped JSON snapshot under
+                 <VaultPath>\_meta\snapshots\<SERVER>\.
+
+      2. Render  Merges every snapshot in the vault (all servers, newest per server) and regenerates the Obsidian notes:
+                 Servers/, Shares/, Folders/, Users/, Groups/, WellKnown/, Orphaned/, Effective/, Reports/, Home.md,
+                 Dashboard.canvas and the Bases views. Existing user notes under Notes/ are never touched.
+
+    Open <VaultPath> in Obsidian as a vault. Start at Home.md.
 
 .PARAMETER ServerName
-    The name of the file server to enumerate.
+    File server to scan (NetBIOS or FQDN; FQDN preferred for Kerberos). Required unless -RenderOnly.
 
-.PARAMETER OutputFile
-    The path to the output file for Cypher code. Defaults to .\FileServerPermissions.cypher
+.PARAMETER Credential
+    Account used for the WinRM session to the file server. Must be a local Administrator or Backup Operator on the
+    server. Prompted with Get-Credential when omitted. AD lookups run as the logged-on user unless -AdCredential is given.
+
+.PARAMETER VaultPath
+    Obsidian vault folder. Default: .\vault next to this script. Created when missing.
+
+.PARAMETER Depth
+    How many folder levels below each share root to walk (0 = share root only). Default 1.
+
+.PARAMETER IncludeShare / ExcludeShare
+    Wildcard filters on share names, e.g. -IncludeShare 'Finance','HR*'.
+
+.PARAMETER DryRun
+    Enumerate shares and share ACLs only (no folder walk). Still resolves principals and writes a snapshot flagged dryRun.
+
+.PARAMETER SkipRender
+    Scan and save the snapshot, but do not regenerate the vault.
+
+.PARAMETER RenderOnly
+    Do not scan; regenerate the vault from the snapshots already in <VaultPath>\_meta\snapshots.
+
+.PARAMETER StaleDays
+    Users whose lastLogonTimestamp is older than this are tagged stale (default 90).
 
 .EXAMPLE
-    .\Export-FileServerPermissions.ps1 -ServerName FS01 -OutputFile C:\temp\permissions.cypher
-#>
+    .\Export-FileServerPermissions.ps1 -ServerName fs01.par.com
+    Prompts for server credentials, scans FS01 one level deep, renders .\vault.
 
-[CmdletBinding()]
+.EXAMPLE
+    .\Export-FileServerPermissions.ps1 -ServerName fs01.par.com -Depth 3 -IncludeShare Finance -DryRun -Verbose
+
+.EXAMPLE
+    $cred = Get-Credential PAR\svc_scan
+    'fs01.par.com','fs02.par.com' | ForEach-Object { .\Export-FileServerPermissions.ps1 -ServerName $_ -Credential $cred -SkipRender }
+    .\Export-FileServerPermissions.ps1 -RenderOnly
+#>
+[CmdletBinding(DefaultParameterSetName = 'Scan')]
 param(
-    [Parameter(Mandatory=$true)]
-    [string]$ServerName,
-    
-    [Parameter(Mandatory=$false)]
-    [string]$OutputFile = ".\FileServerPermissions_$($ServerName)_$(Get-Date -Format 'yyyyMMdd_HHmmss').cypher"
+    [Parameter(Mandatory, ParameterSetName = 'Scan', Position = 0)]
+    [string] $ServerName,
+
+    [Parameter(ParameterSetName = 'Scan')]
+    [System.Management.Automation.PSCredential] $Credential,
+
+    [string] $VaultPath = (Join-Path $PSScriptRoot 'vault'),
+
+    [Parameter(ParameterSetName = 'Scan')] [ValidateRange(0, 32)] [int] $Depth = 1,
+    [Parameter(ParameterSetName = 'Scan')] [string[]] $IncludeShare,
+    [Parameter(ParameterSetName = 'Scan')] [string[]] $ExcludeShare,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $IncludeHiddenShares,
+    [Parameter(ParameterSetName = 'Scan')] [int] $MaxFoldersPerShare = 100000,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $NoGroupExpansion,
+    [Parameter(ParameterSetName = 'Scan')] [int] $MaxGroupDepth = 10,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $SkipAdEnrichment,
+    [Parameter(ParameterSetName = 'Scan')] [string] $AdServer,
+    [Parameter(ParameterSetName = 'Scan')] [System.Management.Automation.PSCredential] $AdCredential,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $DryRun,
+    [Parameter(ParameterSetName = 'Scan')] [int] $TimeoutSeconds = 600,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $SkipRender,
+    [Parameter(ParameterSetName = 'Scan')] [switch] $NoSeed,
+    [Parameter(ParameterSetName = 'Scan')] [int] $SeedMaxAgeHours = 24,
+
+    [Parameter(Mandatory, ParameterSetName = 'RenderOnly')] [switch] $RenderOnly,
+
+    # Render options
+    [string] $PrimaryDomain,
+    [int] $StaleDays = 90,
+    [int] $PasswordAgeDays = 365,
+    [int] $NestingDepthThreshold = 3,
+    [int] $TopN = 25,
+    [int] $RowCap = 500,
+    [int] $LargeGroupThreshold = 500,
+    [string[]] $AdminPrincipal,
+    [int] $MaxHistory = 10,
+    [switch] $InstallPlugins
 )
 
-# Get credentials
-$cred = Get-Credential -Message "Enter credentials to access $ServerName"
+$ErrorActionPreference = 'Stop'
+Import-Module (Join-Path $PSScriptRoot 'FsPerm/FsPerm.psd1') -Force
 
-# Initialize output file
-if (Test-Path $OutputFile) {
-    Remove-Item $OutputFile -Force
+$snapshotRoot = Join-Path $VaultPath '_meta/snapshots'
+if (-not (Test-Path -LiteralPath $VaultPath)) { New-Item -ItemType Directory -Path $VaultPath -Force | Out-Null }
+if ($VaultPath -match 'OneDrive') {
+    Write-Warning 'The vault is inside a OneDrive folder. Regenerating thousands of notes there can hit sync locks; a local path is faster and quieter.'
 }
 
-# Function to write Cypher code with retry logic
-function Write-CypherCode {
-    param([string]$cypher)
-    
-    $maxRetries = 5
-    $retryCount = 0
-    $success = $false
-    
-    while (-not $success -and $retryCount -lt $maxRetries) {
-        try {
-            Add-Content -Path $OutputFile -Value $cypher -Encoding UTF8 -ErrorAction Stop
-            Add-Content -Path $OutputFile -Value "" -Encoding UTF8 -ErrorAction Stop
-            $success = $true
-        }
-        catch {
-            $retryCount++
-            if ($retryCount -lt $maxRetries) {
-                Start-Sleep -Milliseconds (100 * $retryCount)  # Exponential backoff
-            }
-            else {
-                Write-Host "      ERROR: Failed to write to file after $maxRetries attempts: $($_.Exception.Message)" -ForegroundColor Red
-                throw
-            }
-        }
+Write-Host ''
+Write-Host '=== Export-FileServerPermissions ===' -ForegroundColor Cyan
+Write-Host "Vault: $VaultPath" -ForegroundColor Yellow
+
+# ------------------------------------------------------------------ 1. scan
+if ($PSCmdlet.ParameterSetName -eq 'Scan') {
+    if (-not $Credential) {
+        $Credential = Get-Credential -Message "Credentials for $ServerName (must be a local Administrator or Backup Operator on the server)"
+        if (-not $Credential) { throw 'No credential supplied.' }
     }
-}
 
-# Function to extract domain\username or just username
-function Get-AccountInfo {
-    param([string]$identityReference)
-    
-    if ($identityReference -match '^(.+?)\\(.+)$') {
-        return @{
-            Domain = $Matches[1]
-            SamAccountName = $Matches[2]
-            FullName = $identityReference
-        }
-    } else {
-        return @{
-            Domain = ""
-            SamAccountName = $identityReference
-            FullName = $identityReference
-        }
+    $seed = @()
+    if (-not $NoSeed) {
+        # Reuse principals already resolved in earlier snapshots so AD is queried once per fleet run.
+        $seed = @(Get-FsSnapshotIndex -Root $snapshotRoot | Get-FsSorted -Property '-timestamp' | Select-Object -First 3 | ForEach-Object path)
     }
-}
 
-# Function to determine if account is a group or user
-function Get-AccountType {
-    param([string]$samAccountName, [string]$domain)
-    
-    try {
-        if ($domain -and $domain -ne "BUILTIN" -and $domain -ne "NT AUTHORITY") {
-            $searcher = [adsisearcher]"(samAccountName=$samAccountName)"
-            $result = $searcher.FindOne()
-            if ($result) {
-                $objectClass = $result.Properties["objectclass"]
-                if ($objectClass -contains "group") {
-                    return "Group"
-                } elseif ($objectClass -contains "user") {
-                    return "User"
-                }
-            }
-        }
-    } catch {
-        # If AD lookup fails, make educated guess
+    $scanParams = @{
+        ServerName          = $ServerName
+        Credential          = $Credential
+        Depth               = $Depth
+        IncludeHiddenShares = $IncludeHiddenShares
+        MaxFoldersPerShare  = $MaxFoldersPerShare
+        NoGroupExpansion    = $NoGroupExpansion
+        MaxGroupDepth       = $MaxGroupDepth
+        SkipAdEnrichment    = $SkipAdEnrichment
+        DryRun              = $DryRun
+        TimeoutSeconds      = $TimeoutSeconds
     }
-    
-    # Default assumptions for built-in accounts
-    if ($samAccountName -match "group|users|admins|administrators") {
-        return "Group"
-    }
-    
-    return "User"  # Default to User
+    if ($IncludeShare) { $scanParams.IncludeShare = $IncludeShare }
+    if ($ExcludeShare) { $scanParams.ExcludeShare = $ExcludeShare }
+    if ($AdServer) { $scanParams.AdServer = $AdServer }
+    if ($AdCredential) { $scanParams.AdCredential = $AdCredential }
+    if ($seed.Count) { $scanParams.SeedSnapshot = $seed; $scanParams.SeedMaxAgeHours = $SeedMaxAgeHours }
+
+    Write-Host "Scanning $ServerName as $($Credential.UserName) (depth $Depth$(if ($DryRun) { ', dry run' }))" -ForegroundColor Green
+    $snapshot = Invoke-FsScan @scanParams
+    $file = Export-FsSnapshot -Snapshot $snapshot -Directory $snapshotRoot
+    Write-Host "Snapshot saved: $($file.FullName) ($([math]::Round($file.Length / 1KB)) KB)" -ForegroundColor Green
+    Get-FsScanSummary -Snapshot $snapshot | ForEach-Object { Write-Host "  $_" -ForegroundColor Gray }
+
+    if ($SkipRender) { Write-Host "`nRender skipped. Run with -RenderOnly to regenerate the vault." -ForegroundColor Yellow; return }
 }
 
-Write-Host "`n=== File Server Permission Enumeration ===" -ForegroundColor Cyan
-Write-Host "Server: $ServerName" -ForegroundColor Yellow
-Write-Host "Output: $OutputFile`n" -ForegroundColor Yellow
+# ------------------------------------------------------------------ 2. render
+Write-Host "`nRendering vault from snapshots in $snapshotRoot" -ForegroundColor Green
+$history = Import-FsSnapshotHistory -Root $snapshotRoot -MaxHistory $MaxHistory
+if ($history.Count -eq 0) { throw "No snapshots found under $snapshotRoot. Run a scan first." }
+$model = Merge-FsModel -History $history
 
-# If output file is in OneDrive, warn user
-if ($OutputFile -match "OneDrive") {
-    Write-Host "WARNING: Output file is in OneDrive folder. Consider using a local path to avoid file locking issues." -ForegroundColor Yellow
-    Write-Host "Press Enter to continue or Ctrl+C to cancel..." -ForegroundColor Yellow
-    Read-Host
+$optParams = @{
+    Model                 = $model
+    StaleDays             = $StaleDays
+    PasswordAgeDays       = $PasswordAgeDays
+    NestingDepthThreshold = $NestingDepthThreshold
+    TopN                  = $TopN
+    RowCap                = $RowCap
+    LargeGroupThreshold   = $LargeGroupThreshold
+}
+if ($AdminPrincipal) { $optParams.AdminPrincipalIds = $AdminPrincipal }
+$options = Get-FsAnalysisOptions @optParams
+
+$exportParams = @{ Model = $model; VaultPath = $VaultPath; Options = $options }
+if ($PrimaryDomain) { $exportParams.PrimaryDomain = $PrimaryDomain }
+$result = Export-FsVault @exportParams
+
+if ($InstallPlugins) {
+    Write-Host 'Installing optional Obsidian community plugins (Dataview)...' -ForegroundColor Green
+    Install-FsObsidianPlugin -VaultPath $VaultPath -PluginId dataview
 }
 
-# Create Server node
-Write-Host "[1/4] Creating Server node..." -ForegroundColor Green
-$serverCypher = @"
-// ============================================
-// CREATE SERVER NODE
-// ============================================
-MERGE (server:Server {name: "$ServerName"})
-ON CREATE SET server.created = datetime()
-ON MATCH SET server.lastScanned = datetime();
-"@
-
-Write-CypherCode -cypher $serverCypher
-
-# Get shares using WMI with credentials
-Write-Host "[2/4] Enumerating shares..." -ForegroundColor Green
-try {
-    $shares = Get-WmiObject -Class Win32_Share -ComputerName $ServerName -Credential $cred | 
-              Where-Object { $_.Type -eq 0 -and $_.Name -notmatch '\$$' }
-    
-    Write-Host "    Found $($shares.Count) shares" -ForegroundColor Gray
-} catch {
-    Write-Host "    ERROR: Failed to enumerate shares - $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
-}
-
-# Create CIM session for share permissions
-Write-Host "    Creating CIM session..." -ForegroundColor Gray
-try {
-    $cimSession = New-CimSession -ComputerName $ServerName -Credential $cred
-} catch {
-    Write-Host "    ERROR: Failed to create CIM session - $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
-}
-
-$shareCount = 0
-$totalShares = $shares.Count
-
-# Process each share
-Write-Host "[3/4] Processing share permissions..." -ForegroundColor Green
-foreach ($share in $shares) {
-    $shareCount++
-    $shareName = $share.Name
-    $sharePath = $share.Path
-    $uncPath = "\\$ServerName\$shareName"
-    
-    Write-Host "    [$shareCount/$totalShares] Processing share: $shareName" -ForegroundColor Gray
-    
-    # Escape for Cypher - do it RIGHT HERE inline
-    $safeShareName = $shareName.Replace('\', '\\').Replace('"', '\"')
-    $safeSharePath = $sharePath.Replace('\', '\\').Replace('"', '\"')
-    $safeUncPath = $uncPath.Replace('\', '\\').Replace('"', '\"')
-    
-    # Create Share node and link to Server
-    $shareCypher = @"
-// ============================================
-// SHARE: $shareName
-// ============================================
-MERGE (share:Share {name: "$safeShareName", server: "$ServerName"})
-ON CREATE SET
-    share.path = "$safeSharePath",
-    share.uncPath = "$safeUncPath",
-    share.created = datetime()
-ON MATCH SET share.lastScanned = datetime();
-
-MATCH (server:Server {name: "$ServerName"})
-MATCH (share:Share {name: "$safeShareName", server: "$ServerName"})
-MERGE (server)-[:HOSTS]->(share);
-"@
-    
-    Write-CypherCode -cypher $shareCypher
-    
-    # Get share-level permissions using CIM
-    try {
-        $shareAccess = Get-SmbShareAccess -Name $shareName -CimSession $cimSession -ErrorAction Stop
-        
-        foreach ($perm in $shareAccess) {
-            $accountName = $perm.AccountName
-            $accountInfo = Get-AccountInfo -identityReference $accountName
-            $accountType = Get-AccountType -samAccountName $accountInfo.SamAccountName -domain $accountInfo.Domain
-            
-            $permissionString = $perm.AccessRight.ToString()
-            $accessType = $perm.AccessControlType.ToString()
-            
-            # Escape inline
-            $safeSamAccountName = $accountInfo.SamAccountName.Replace('\', '\\').Replace('"', '\"')
-            $safeDomain = $accountInfo.Domain.Replace('\', '\\').Replace('"', '\"')
-            $safeFullName = $accountInfo.FullName.Replace('\', '\\').Replace('"', '\"')
-            
-            # Create User/Group node and relationship
-            $principalCypher = @"
-// Share Permission: $accountName -> $shareName
-MERGE (principal:$accountType {samAccountName: "$safeSamAccountName"})
-ON CREATE SET
-    principal.domain = "$safeDomain",
-    principal.fullName = "$safeFullName",
-    principal.created = datetime();
-
-MATCH (principal:$accountType {samAccountName: "$safeSamAccountName"})
-MATCH (share:Share {name: "$safeShareName", server: "$ServerName"})
-MERGE (principal)-[r:HAS_SHARE_ACCESS]->(share)
-ON CREATE SET
-    r.permissions = "$permissionString",
-    r.accessType = "$accessType",
-    r.discovered = datetime()
-ON MATCH SET
-    r.permissions = "$permissionString",
-    r.accessType = "$accessType",
-    r.lastSeen = datetime();
-"@
-            
-            Write-CypherCode -cypher $principalCypher
-        }
-    } catch {
-        Write-Host "      WARNING: Could not retrieve share permissions for $shareName - $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-# Process NTFS permissions for top-level folders
-Write-Host "[4/4] Processing NTFS permissions for top-level folders..." -ForegroundColor Green
-$folderCount = 0
-
-foreach ($share in $shares) {
-    $shareName = $share.Name
-    $uncPath = "\\$ServerName\$shareName"
-    $sharePath = $share.Path
-    
-    Write-Host "    Processing share: $shareName" -ForegroundColor Gray
-    
-    try {
-        # Remote script that extracts all ACL info before returning
-        $remoteScript = {
-            param($sharePath, $shareName)
-            
-            # Create a result object that we'll always return
-            $result = [PSCustomObject]@{
-                Success = $false
-                ShareError = $null
-                Folders = @()
-            }
-            
-            try {
-                # Check if path exists
-                if (-not (Test-Path -Path $sharePath)) {
-                    $result.ShareError = "Path does not exist: $sharePath"
-                    return $result
-                }
-                
-                # Try to get folders
-                $topFolders = Get-ChildItem -Path $sharePath -Directory -ErrorAction Stop
-                
-                if (-not $topFolders) {
-                    $result.Success = $true
-                    $result.ShareError = "No folders found in share"
-                    return $result
-                }
-                
-                foreach ($folder in $topFolders) {
-                    $folderInfo = [PSCustomObject]@{
-                        Name = $folder.Name
-                        FullName = $folder.FullName
-                        Permissions = @()
-                        Error = $null
-                    }
-                    
-                    try {
-                        $acl = Get-Acl -Path $folder.FullName -ErrorAction Stop
-                        
-                        # Extract all ACL information into serializable format
-                        foreach ($access in $acl.Access) {
-                            $permissionInfo = [PSCustomObject]@{
-                                IdentityReference = $access.IdentityReference.Value
-                                FileSystemRights = $access.FileSystemRights.ToString()
-                                AccessControlType = $access.AccessControlType.ToString()
-                                IsInherited = $access.IsInherited
-                                InheritanceFlags = $access.InheritanceFlags.ToString()
-                                PropagationFlags = $access.PropagationFlags.ToString()
-                            }
-                            $folderInfo.Permissions += $permissionInfo
-                        }
-                    } catch {
-                        $folderInfo.Error = $_.Exception.Message
-                    }
-                    
-                    $result.Folders += $folderInfo
-                }
-                
-                $result.Success = $true
-                
-            } catch {
-                $result.ShareError = $_.Exception.Message
-            }
-            
-            return $result
-        }
-        
-        $remoteResult = Invoke-Command -ComputerName $ServerName -Credential $cred -ScriptBlock $remoteScript -ArgumentList $sharePath, $shareName -ErrorAction Stop
-        
-        # Check the result structure
-        if (-not $remoteResult) {
-            Write-Host "      WARNING: No result returned from remote command for share $shareName" -ForegroundColor Yellow
-            continue
-        }
-        
-        if ($remoteResult.ShareError) {
-            Write-Host "      INFO: $($remoteResult.ShareError)" -ForegroundColor Gray
-            continue
-        }
-        
-        if (-not $remoteResult.Success) {
-            Write-Host "      WARNING: Remote command failed for share $shareName" -ForegroundColor Yellow
-            continue
-        }
-        
-        $remoteFolders = $remoteResult.Folders
-        
-        if (-not $remoteFolders -or $remoteFolders.Count -eq 0) {
-            continue
-        }
-        
-        Write-Host "      Found $($remoteFolders.Count) folders" -ForegroundColor Gray
-        
-        foreach ($folderInfo in $remoteFolders) {
-            $folderCount++
-            $folderName = $folderInfo.Name
-            $folderFullPath = "$uncPath\$folderName"
-            
-            # Escape inline
-            $safeFolderName = $folderName.Replace('\', '\\').Replace('"', '\"')
-            $safeFolderPath = $folderFullPath.Replace('\', '\\').Replace('"', '\"')
-            $safeShareName = $shareName.Replace('\', '\\').Replace('"', '\"')
-            
-            # Create Folder node
-            $folderCypher = @"
-// ============================================
-// FOLDER: $folderName in share $shareName
-// ============================================
-MERGE (folder:Folder {path: "$safeFolderPath"})
-ON CREATE SET
-    folder.name = "$safeFolderName",
-    folder.share = "$safeShareName",
-    folder.server = "$ServerName",
-    folder.created = datetime()
-ON MATCH SET folder.lastScanned = datetime();
-
-MATCH (share:Share {name: "$safeShareName", server: "$ServerName"})
-MATCH (folder:Folder {path: "$safeFolderPath"})
-MERGE (share)-[:CONTAINS]->(folder);
-"@
-            
-            Write-CypherCode -cypher $folderCypher
-            
-            # Process NTFS permissions
-            if ($folderInfo.Permissions -and $folderInfo.Permissions.Count -gt 0) {
-                foreach ($permission in $folderInfo.Permissions) {
-                    $accountInfo = Get-AccountInfo -identityReference $permission.IdentityReference
-                    $accountType = Get-AccountType -samAccountName $accountInfo.SamAccountName -domain $accountInfo.Domain
-                    
-                    $rights = $permission.FileSystemRights
-                    $accessType = $permission.AccessControlType
-                    $isInherited = $permission.IsInherited
-                    
-                    # Escape inline
-                    $safeSamAccountName = $accountInfo.SamAccountName.Replace('\', '\\').Replace('"', '\"')
-                    $safeDomain = $accountInfo.Domain.Replace('\', '\\').Replace('"', '\"')
-                    $safeFullName = $accountInfo.FullName.Replace('\', '\\').Replace('"', '\"')
-                    $safeRights = $rights.Replace('\', '\\').Replace('"', '\"')
-                    
-                    # Create User/Group node and relationship
-                    $ntfsCypher = @"
-// NTFS Permission: $($accountInfo.FullName) -> $folderName
-MERGE (principal:$accountType {samAccountName: "$safeSamAccountName"})
-ON CREATE SET
-    principal.domain = "$safeDomain",
-    principal.fullName = "$safeFullName",
-    principal.created = datetime();
-
-MATCH (principal:$accountType {samAccountName: "$safeSamAccountName"})
-MATCH (folder:Folder {path: "$safeFolderPath"})
-MERGE (principal)-[r:HAS_NTFS_ACCESS]->(folder)
-ON CREATE SET
-    r.permissions = "$safeRights",
-    r.accessType = "$accessType",
-    r.isInherited = $($isInherited.ToString().ToLower()),
-    r.discovered = datetime()
-ON MATCH SET
-    r.permissions = "$safeRights",
-    r.accessType = "$accessType",
-    r.isInherited = $($isInherited.ToString().ToLower()),
-    r.lastSeen = datetime();
-"@
-                    
-                    Write-CypherCode -cypher $ntfsCypher
-                }
-            }
-        }
-        
-    } catch {
-        Write-Host "      WARNING: Could not process share $shareName - $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-}
-
-# Clean up CIM session
-Remove-CimSession -CimSession $cimSession
-
-Write-Host "`n=== Enumeration Complete ===" -ForegroundColor Cyan
-Write-Host "Processed:" -ForegroundColor Yellow
-Write-Host "  - 1 Server" -ForegroundColor Gray
-Write-Host "  - $totalShares Shares" -ForegroundColor Gray
-Write-Host "  - $folderCount Top-level Folders" -ForegroundColor Gray
-Write-Host "`nCypher output saved to: $OutputFile" -ForegroundColor Green
-Write-Host "`nYou can now import this file into your graph database.`n" -ForegroundColor Cyan
+Write-Host ''
+Write-Host '=== Done ===' -ForegroundColor Cyan
+Write-Host ("  Servers: {0}   Shares: {1}   Folders: {2}   Users: {3}   Groups: {4}" -f $model.servers.Count, $model.shares.Count,
+    @($model.folders.Values | Where-Object { -not $_['isShareRoot'] }).Count,
+    @($model.principals.Values | Where-Object { $_['kind'] -eq 'User' }).Count,
+    @($model.principals.Values | Where-Object { $_['kind'] -in 'Group', 'LocalGroup' }).Count) -ForegroundColor Gray
+Write-Host ("  Notes written: {0}   unchanged: {1}   removed: {2}   warnings: {3}" -f $result.written, $result.skipped, $result.deleted, @($result.warnings).Count) -ForegroundColor Gray
+foreach ($w in @($result.warnings) | Select-Object -First 10) { Write-Warning $w }
+Write-Host "`nOpen this folder in Obsidian as a vault and start at Home.md:" -ForegroundColor Green
+Write-Host "  $VaultPath`n" -ForegroundColor Yellow

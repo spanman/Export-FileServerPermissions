@@ -1,0 +1,10 @@
+# Test image: PowerShell 7 on Linux with Pester 5 and PSScriptAnalyzer.
+# Build once:  docker build -t fsperm-test -f build/Dockerfile.test build
+FROM mcr.microsoft.com/powershell:latest
+SHELL ["pwsh", "-NoProfile", "-Command"]
+RUN Set-PSRepository -Name PSGallery -InstallationPolicy Trusted; \
+    Install-Module -Name Pester -MinimumVersion 5.5.0 -MaximumVersion 5.99.99 -Force -Scope AllUsers; \
+    Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.22.0 -Force -Scope AllUsers; \
+    Get-Module -ListAvailable Pester, PSScriptAnalyzer | Select-Object Name, Version
+WORKDIR /work
+ENTRYPOINT ["pwsh", "-NoProfile"]
