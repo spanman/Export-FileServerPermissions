@@ -257,29 +257,41 @@ function Get-FsAdDomainTable {
     # Never $null: it becomes a dictionary key at $domains[$domainSid] below, and dictionary keys can't be null.
     $domainSid = $defaultNc
     $domainSidDegraded = $false
+    $resolved = $null
+    # Two independent attempts, since a real production domain was seen to defeat each of these
+    # individually - every domain-scoped SID classification and batched AD lookup downstream keys off
+    # this value, so a silent miss here caused (almost) every principal to fall through to the
+    # Foreign/OrphanedSid classification instead of resolving as a real User/Group.
     try {
-        # A Base-scoped DirectorySearcher with an explicit PropertiesToLoad (the same mechanism the
-        # crossRef/trustedDomain queries below already use successfully), not a raw
-        # `New-FsAdEntry ... | .Properties['objectSid']`: a bare DirectoryEntry's lazily-cached
-        # Properties collection was observed, against a real production domain, to simply not
-        # contain objectSid (no exception - the value came back $null), while an explicit search
-        # requesting that attribute by name reliably returns it. Root cause of a real incident:
-        # every domain-scoped SID classification and batched AD lookup downstream keys off this
-        # value, so a silent miss here caused (almost) every principal to fall through to the
-        # Foreign/OrphanedSid classification instead of resolving as a real User/Group.
-        $domainSearcher = New-FsAdSearcher -LdapPath $defaultNc -Server $Server -Credential $Credential -PropertiesToLoad @('objectSid')
-        $domainSearcher.Searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
-        $domainResults = Invoke-FsAdSearch -Searcher $domainSearcher -Filter '(objectClass=*)'
-        $resolved = $(if ($domainResults.Count -gt 0) { [string](Get-FsAdSearchResultValue -Result $domainResults[0] -Name 'objectSid') } else { $null })
-        if ($resolved) { $domainSid = $resolved }
-        else {
-            $domainSidDegraded = $true
-            Write-Verbose "'$defaultNc' returned no objectSid; using its DN as a stand-in key. Domain-relative RID matching (Domain Users/Admins/...) will be unavailable."
-        }
+        # Attempt 1: explicit RefreshCache(@('objectSid')) on the raw DirectoryEntry - the same technique
+        # already used (for OTHER domains) by Get-FsAdSearcherForDomain below, because a DirectoryEntry's
+        # lazily-cached Properties collection was observed, against this domain, to simply not contain
+        # objectSid without an explicit refresh request (no exception - the value came back $null).
+        $domainEntry = New-FsAdEntry -Path $defaultNc -Server $Server -Credential $Credential
+        [void]$domainEntry.RefreshCache(@('objectSid'))
+        $sidBytes = $domainEntry.Properties['objectSid'].Value
+        $resolved = [string](ConvertFrom-FsAdValue -Value $sidBytes -Name 'objectSid')
     }
-    catch {
+    catch { Write-Verbose "RefreshCache(objectSid) attempt failed for '$defaultNc': $($_.Exception.Message)" }
+    if (-not $resolved) {
+        try {
+            # Attempt 2: a Base-scoped DirectorySearcher with an explicit PropertiesToLoad, PageSize
+            # forced to 0. PageSize must be 0 (disable the paged-results LDAP control) for a Base-scoped
+            # search: real Active Directory silently returns zero entries for a paged Base search instead
+            # of erroring, and New-FsAdSearcher's default PageSize (1000, meant for the Subtree searches
+            # below) would otherwise still be active.
+            $domainSearcher = New-FsAdSearcher -LdapPath $defaultNc -Server $Server -Credential $Credential -PropertiesToLoad @('objectSid')
+            $domainSearcher.Searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
+            $domainSearcher.Searcher.PageSize = 0
+            $domainResults = Invoke-FsAdSearch -Searcher $domainSearcher -Filter '(objectClass=*)'
+            $resolved = $(if ($domainResults.Count -gt 0) { [string](Get-FsAdSearchResultValue -Result $domainResults[0] -Name 'objectSid') } else { $null })
+        }
+        catch { Write-Verbose "Base-scoped search attempt failed for '$defaultNc': $($_.Exception.Message)" }
+    }
+    if ($resolved) { $domainSid = $resolved }
+    else {
         $domainSidDegraded = $true
-        Write-Verbose "Could not read objectSid for '$defaultNc' ($($_.Exception.Message)); using its DN as a stand-in key. Domain-relative RID matching (Domain Users/Admins/...) will be unavailable."
+        Write-Verbose "'$defaultNc' returned no objectSid via either lookup method; using its DN as a stand-in key. Domain-relative RID matching (Domain Users/Admins/...) will be unavailable."
     }
     $netbios = $null
 

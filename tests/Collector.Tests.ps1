@@ -267,9 +267,13 @@ Describe 'Get-FsAdDomainTable' {
         # crossRef/trustedDomain enumeration, all go through New-FsAdSearcher/Invoke-FsAdSearch instead
         # (a Base-scoped DirectorySearcher with explicit PropertiesToLoad reliably returns objectSid where
         # a bare DirectoryEntry.Properties lookup was observed, against a real domain, to silently miss it).
-        # New-FsAdSearcher's return only needs a settable .Searcher.SearchScope - Get-FsAdDomainTable sets
-        # that directly - everything else about the real search runs through the mocked Invoke-FsAdSearch.
-        Mock -CommandName New-FsAdSearcher -ModuleName FsPerm { @{ Searcher = [pscustomobject]@{ SearchScope = $null } } }
+        # New-FsAdSearcher's return only needs a settable .Searcher.SearchScope/.PageSize -
+        # Get-FsAdDomainTable sets those directly - everything else about the real search runs through
+        # the mocked Invoke-FsAdSearch. Both properties must be pre-declared: assigning a brand-new
+        # property to a [pscustomobject] (one that wasn't in the original hash literal) throws "The
+        # property '...' cannot be found on this object", unlike a real DirectorySearcher which always
+        # has both.
+        Mock -CommandName New-FsAdSearcher -ModuleName FsPerm { @{ Searcher = [pscustomobject]@{ SearchScope = $null; PageSize = 1000 } } }
         # Default: no results (covers crossRef/trustedDomain enumeration, exercised elsewhere as a no-op here).
         Mock -CommandName Invoke-FsAdSearch -ModuleName FsPerm { @() }
     }
