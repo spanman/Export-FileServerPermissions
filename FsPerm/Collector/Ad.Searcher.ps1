@@ -261,7 +261,11 @@ function Get-FsAdDomainTable {
     # Two independent attempts, since a real production domain was seen to defeat each of these
     # individually - every domain-scoped SID classification and batched AD lookup downstream keys off
     # this value, so a silent miss here caused (almost) every principal to fall through to the
-    # Foreign/OrphanedSid classification instead of resolving as a real User/Group.
+    # Foreign/OrphanedSid classification instead of resolving as a real User/Group. $diag records
+    # precisely what each attempt observed (threw vs. silently empty vs. zero results) since two prior
+    # fix attempts against the same real domain failed identically with no way to tell why - this is
+    # surfaced into the scan's errors[] below so the next failure is diagnosable without guessing.
+    $diag = [System.Collections.Generic.List[string]]::new()
     try {
         # Attempt 1: explicit RefreshCache(@('objectSid')) on the raw DirectoryEntry - the same technique
         # already used (for OTHER domains) by Get-FsAdSearcherForDomain below, because a DirectoryEntry's
@@ -270,9 +274,13 @@ function Get-FsAdDomainTable {
         $domainEntry = New-FsAdEntry -Path $defaultNc -Server $Server -Credential $Credential
         [void]$domainEntry.RefreshCache(@('objectSid'))
         $sidBytes = $domainEntry.Properties['objectSid'].Value
-        $resolved = [string](ConvertFrom-FsAdValue -Value $sidBytes -Name 'objectSid')
+        if ($null -eq $sidBytes) { $diag.Add('RefreshCache: bind+refresh succeeded but Properties[objectSid].Value is null.') }
+        else {
+            $resolved = [string](ConvertFrom-FsAdValue -Value $sidBytes -Name 'objectSid')
+            if (-not $resolved) { $diag.Add("RefreshCache: objectSid bytes present (length $($sidBytes.Length)) but conversion to a SID string produced an empty result.") }
+        }
     }
-    catch { Write-Verbose "RefreshCache(objectSid) attempt failed for '$defaultNc': $($_.Exception.Message)" }
+    catch { $diag.Add("RefreshCache: threw $($_.Exception.GetType().Name): $($_.Exception.Message)") }
     if (-not $resolved) {
         try {
             # Attempt 2: a Base-scoped DirectorySearcher with an explicit PropertiesToLoad, PageSize
@@ -283,10 +291,14 @@ function Get-FsAdDomainTable {
             $domainSearcher = New-FsAdSearcher -LdapPath $defaultNc -Server $Server -Credential $Credential -PropertiesToLoad @('objectSid')
             $domainSearcher.Searcher.SearchScope = [System.DirectoryServices.SearchScope]::Base
             $domainSearcher.Searcher.PageSize = 0
-            $domainResults = Invoke-FsAdSearch -Searcher $domainSearcher -Filter '(objectClass=*)'
-            $resolved = $(if ($domainResults.Count -gt 0) { [string](Get-FsAdSearchResultValue -Result $domainResults[0] -Name 'objectSid') } else { $null })
+            $domainResults = @(Invoke-FsAdSearch -Searcher $domainSearcher -Filter '(objectClass=*)')
+            if ($domainResults.Count -eq 0) { $diag.Add('BaseSearch: executed without throwing but returned 0 results for (objectClass=*) at the domain DN.') }
+            else {
+                $resolved = [string](Get-FsAdSearchResultValue -Result $domainResults[0] -Name 'objectSid')
+                if (-not $resolved) { $diag.Add("BaseSearch: $($domainResults.Count) result(s) returned but objectSid was empty/missing on the first one.") }
+            }
         }
-        catch { Write-Verbose "Base-scoped search attempt failed for '$defaultNc': $($_.Exception.Message)" }
+        catch { $diag.Add("BaseSearch: threw $($_.Exception.GetType().Name): $($_.Exception.Message)") }
     }
     if ($resolved) { $domainSid = $resolved }
     else {
@@ -299,7 +311,12 @@ function Get-FsAdDomainTable {
     $forest = [System.Collections.Generic.List[string]]::new()
     try {
         $partitions = New-FsAdSearcher -LdapPath "CN=Partitions,$configNc" -Server $Server -Credential $Credential -PropertiesToLoad @('nCName', 'nETBIOSName', 'dnsRoot')
-        foreach ($r in Invoke-FsAdSearch -Searcher $partitions -Filter '(&(objectClass=crossRef)(nETBIOSName=*))') {
+        $crossRefResults = @(Invoke-FsAdSearch -Searcher $partitions -Filter '(&(objectClass=crossRef)(nETBIOSName=*))')
+        # One more data point for $diag: does ANY subtree search return results at all, or is it just
+        # the domain-object Base search that comes back empty? Distinguishes "this one query is broken"
+        # from "every AD query from this identity/connection silently returns nothing."
+        $diag.Add("crossRef enumeration: $($crossRefResults.Count) result(s).")
+        foreach ($r in $crossRefResults) {
             $nc = [string](Get-FsAdSearchResultValue -Result $r -Name 'nCName')
             $nb = [string](Get-FsAdSearchResultValue -Result $r -Name 'nETBIOSName')
             $dr = [string](Get-FsAdSearchResultValue -Result $r -Name 'dnsRoot')
@@ -307,10 +324,13 @@ function Get-FsAdDomainTable {
             if ($nc -and $nc -ieq $defaultNc) { $netbios = $nb }
         }
     }
-    catch { Write-Verbose "crossRef enumeration failed: $($_.Exception.Message)" }
+    catch {
+        $diag.Add("crossRef enumeration: threw $($_.Exception.GetType().Name): $($_.Exception.Message)")
+        Write-Verbose "crossRef enumeration failed: $($_.Exception.Message)"
+    }
     if (-not $netbios) { $netbios = ($dnsRoot.Split('.')[0]).ToUpperInvariant() }
 
-    $primary = @{ sid = $domainSid; netbios = $netbios; dns = $dnsRoot; dn = $defaultNc; isPrimary = $true; source = 'RootDSE'; trustDirection = $null; trustPartner = $null; server = $dnsHostName; sidDegraded = $domainSidDegraded }
+    $primary = @{ sid = $domainSid; netbios = $netbios; dns = $dnsRoot; dn = $defaultNc; isPrimary = $true; source = 'RootDSE'; trustDirection = $null; trustPartner = $null; server = $dnsHostName; sidDegraded = $domainSidDegraded; sidDiagnostics = @($diag) }
     $domains[$domainSid] = $primary
 
     try {

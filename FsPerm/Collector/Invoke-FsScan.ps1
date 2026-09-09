@@ -92,8 +92,9 @@ function Invoke-FsScan {
                     # domain-scoped SID classification and lookup, so this is surfaced as a real scan error -
                     # not just Write-Verbose - so it shows up in Reports/16-ScanHealth and is diagnosable from
                     # the snapshot alone, without needing -Verbose output captured live.
+                    $diagText = (@($context.DomainTable.Primary.sidDiagnostics) -join ' | ')
                     Add-FsScanError -Context $context -Phase AdResolve -Scope 'DomainDiscovery' -Kind Directory `
-                        -Message "Could not read the domain object's objectSid for '$($context.DomainTable.Primary.dn)'; using its distinguished name as a stand-in key instead. Every principal's domain SID classification and AD lookup depends on this value being correct, so results from this scan are likely to be almost entirely unresolved (Foreign/OrphanedSid) rather than proper User/Group records." | Out-Null
+                        -Message "Could not read the domain object's objectSid for '$($context.DomainTable.Primary.dn)'; using its distinguished name as a stand-in key instead. Every principal's domain SID classification and AD lookup depends on this value being correct, so results from this scan are likely to be almost entirely unresolved (Foreign/OrphanedSid) rather than proper User/Group records. Diagnostics: $diagText" | Out-Null
                 }
             }
             catch { Add-FsScanError -Context $context -Phase AdResolve -Scope 'DomainDiscovery' -ErrorRecord $_ | Out-Null }
